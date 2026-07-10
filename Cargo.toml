@@ -1,0 +1,10 @@
+[package]
+name = "rclamonacc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+deadpool = { version = "0.13.0", features = ["rt_tokio_1"] }
+nix = { version = "0.31.3", features = ["fanotify", "socket", "uio"] }
+procfs = "0.18.0"
+tokio = { version = "1.52.3", features = ["full"] }
