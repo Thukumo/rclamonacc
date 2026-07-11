@@ -151,7 +151,10 @@ async fn job(fd: BorrowedFd<'_>, pid: u32, cfg: Arc<config::Config>) -> Response
                         }
                     }
                 }
-                Err(_) => cfg.res_on_error,
+                Err(e) => {
+                    eprintln!("Failed to get connection from pool: {e:?}");
+                    cfg.res_on_error
+                }
             }
         } else {
             Response::FAN_ALLOW

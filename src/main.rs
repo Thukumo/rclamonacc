@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool: managed::Pool::<pool::StreamManager>::builder(pool::StreamManager::new(
             cfg.socket_path.into(),
         ))
+        .runtime(deadpool::Runtime::Tokio1)
         .max_size(cfg.max_connection)
         .build()?,
     });
