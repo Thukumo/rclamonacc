@@ -1,4 +1,3 @@
-use deadpool::managed::{self, Object};
 use inotify::{EventMask, Inotify, StreamExt as _, WatchMask};
 use nix::{
     errno::Errno,
@@ -14,9 +13,12 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, unix::AsyncFd};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _, unix::AsyncFd},
+    net::UnixStream,
+};
 
-use crate::{config, job, pool::StreamManager};
+use crate::{config, job};
 
 async fn send_fildes(
     stream: &mut tokio::net::UnixStream,
@@ -62,42 +64,12 @@ async fn read_response(
 }
 
 async fn scan(
-    conn: Object<StreamManager>,
+    cfg: Arc<config::Config>,
     fd: BorrowedFd<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    struct ScanConnection(Option<Object<StreamManager>>);
-
-    impl ScanConnection {
-        fn new(conn: Object<StreamManager>) -> Self {
-            Self(Some(conn))
-        }
-
-        fn recycle(mut self) {
-            let _ = self.0.take();
-        }
-    }
-
-    impl std::ops::Deref for ScanConnection {
-        type Target = Object<StreamManager>;
-        fn deref(&self) -> &Self::Target {
-            self.0.as_ref().unwrap()
-        }
-    }
-    impl std::ops::DerefMut for ScanConnection {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            self.0.as_mut().unwrap()
-        }
-    }
-    impl Drop for ScanConnection {
-        fn drop(&mut self) {
-            if let Some(conn) = self.0.take() {
-                let _ = Object::take(conn);
-            }
-        }
-    }
-
-    let mut conn = ScanConnection::new(conn);
-
+    let mut conn = UnixStream::connect(&cfg.socket_path)
+        .await
+        .map_err(|e| format!("Failed to create connection: {e}"))?;
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         job::send_fildes(&mut conn, fd),
@@ -116,51 +88,56 @@ async fn scan(
     .and_then(|inner| inner.map_err(|e| format!("Read Error: {e:?}")))
     .map_err(Box::<dyn std::error::Error>::from)?;
 
-    conn.recycle();
-
     Ok(resp)
 }
 
 async fn job(fd: BorrowedFd<'_>, pid: u32, cfg: Arc<config::Config>) -> Response {
     if cfg.pids.contains(&pid) || pid == cfg.clamd_pid.load(std::sync::atomic::Ordering::Acquire) {
         Response::FAN_ALLOW
-    } else if let Ok(file_path) = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
-        if cfg.dirs.iter().any(|dir| file_path.starts_with(dir)) {
-            match cfg
-                .pool
-                .timeout_get(&managed::Timeouts::wait_millis(5000))
-                .await
-            {
-                Ok(conn) => {
-                    match scan(conn, fd).await {
-                        Ok(resp) => {
-                            if resp.ends_with("OK") {
-                                Response::FAN_ALLOW
-                            } else if resp.ends_with("FOUND") {
-                                println!("Threat detected: {resp}");
-                                Response::FAN_DENY
-                            } else {
-                                // ERROR
-                                eprintln!("Error: {resp}");
-                                cfg.res_on_error
+    } else {
+        match fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
+            Ok(file_path) => {
+                if cfg.dirs.iter().any(|dir| file_path.starts_with(dir)) {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        cfg.semaphore.acquire(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            match scan(cfg.clone(), fd).await {
+                                Ok(resp) => {
+                                    if resp.ends_with("OK") {
+                                        Response::FAN_ALLOW
+                                    } else if resp.ends_with("FOUND") {
+                                        println!("Threat detected: {resp}");
+                                        Response::FAN_DENY
+                                    } else {
+                                        // ERROR
+                                        eprintln!("Error Responce: {resp}");
+                                        cfg.res_on_error
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to scan: {e:?}");
+                                    cfg.res_on_error
+                                }
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to read response: {e:?}");
+                            eprintln!("Failed to acquire semaphore: {e:?}");
                             cfg.res_on_error
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!("Failed to get connection from pool: {e:?}");
-                    cfg.res_on_error
+                } else {
+                    Response::FAN_ALLOW
                 }
             }
-        } else {
-            Response::FAN_ALLOW
+            Err(e) => {
+                eprintln!("Failed to get file path: {e:?}");
+                cfg.res_on_error
+            }
         }
-    } else {
-        cfg.res_on_error
     }
 }
 

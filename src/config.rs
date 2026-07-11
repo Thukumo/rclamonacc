@@ -1,10 +1,8 @@
 use std::{path::PathBuf, sync::atomic::AtomicU32};
 
-use deadpool::managed::Pool;
 use nix::sys::fanotify::Response;
 use serde::Deserialize;
-
-use crate::pool;
+use tokio::sync::Semaphore;
 
 #[derive(Deserialize)]
 pub struct Setting {
@@ -43,5 +41,6 @@ pub struct Config {
     pub clamd_pid: AtomicU32,
     pub dirs: Vec<PathBuf>,
     pub res_on_error: Response,
-    pub pool: Pool<pool::StreamManager>,
+    pub semaphore: Semaphore,
+    pub socket_path: PathBuf,
 }

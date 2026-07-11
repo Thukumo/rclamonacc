@@ -6,7 +6,6 @@ use std::sync::atomic::AtomicU32;
 use std::{fs, os::fd::BorrowedFd, process, sync::Arc};
 
 use clap::Parser;
-use deadpool::managed;
 use nix::errno::Errno;
 use nix::sys::fanotify::Response;
 
@@ -15,10 +14,10 @@ use nix::{
     sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags},
 };
 use procfs::process::Process;
+use tokio::sync::Semaphore;
 
 mod config;
 mod job;
-mod pool;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,12 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Response::FAN_ALLOW
         },
-        pool: managed::Pool::<pool::StreamManager>::builder(pool::StreamManager::new(
-            cfg.socket_path.into(),
-        ))
-        .runtime(deadpool::Runtime::Tokio1)
-        .max_size(cfg.max_connection)
-        .build()?,
+        semaphore: Semaphore::new(cfg.max_connection),
+        socket_path: cfg.socket_path.into(),
     });
 
     let mountpoints = Process::myself()
