@@ -50,7 +50,7 @@ pub async fn event_loop(
     let fanotify = Arc::new(AsyncFd::new(fanotify)?);
 
     let mut path = [0u8; 32];
-    let mut res = [0u8; 4096];
+    let mut file_path = [0u8; 4096];
 
     loop {
         let mut guard = fanotify.readable().await?;
@@ -60,51 +60,56 @@ pub async fn event_loop(
                     eprintln!("!! Queue overflowed !!");
                 }
                 for event in events.into_iter().filter(|e| e.fd().is_some()) {
-                    let pid = event.pid().cast_unsigned();
-                    if cfg.pids.contains(&pid)
-                        || pid == cfg.clamd_pid.load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        let _ = fanotify.get_ref().write_response(FanotifyResponse::new(
-                            event.fd().unwrap(),
-                            cfg.res_on_error,
-                        ));
-                        continue;
-                    }
+                    let res = {
+                        let pid = event.pid().cast_unsigned();
+                        if cfg.pids.contains(&pid)
+                            || pid == cfg.clamd_pid.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            Some(Response::FAN_ALLOW)
+                        } else {
+                            let mut cursor = std::io::Cursor::new(&mut path[..]);
+                            // これはコケないのでunwrapして良い
+                            std::io::Write::write_fmt(
+                                &mut cursor,
+                                format_args!("/proc/self/fd/{}\0", event.fd().unwrap().as_raw_fd()),
+                            )
+                            .unwrap();
 
-                    let mut cursor = std::io::Cursor::new(&mut path[..]);
-                    // これはコケないのでunwrapして良い
-                    std::io::Write::write_fmt(
-                        &mut cursor,
-                        format_args!("/proc/self/fd/{}\0", event.fd().unwrap().as_raw_fd()),
-                    )
-                    .unwrap();
-
-                    let len = unsafe {
-                        libc::readlink(
-                            path.as_ptr().cast::<libc::c_char>(),
-                            res.as_mut_ptr().cast::<libc::c_char>(),
-                            res.len(),
-                        )
+                            let len = unsafe {
+                                libc::readlink(
+                                    path.as_ptr().cast::<libc::c_char>(),
+                                    file_path.as_mut_ptr().cast::<libc::c_char>(),
+                                    file_path.len(),
+                                )
+                            };
+                            if len <= 0 {
+                                eprintln!(
+                                    "Failed to get file path: {:?}",
+                                    std::io::Error::last_os_error()
+                                );
+                                Some(cfg.res_on_error)
+                            } else {
+                                let len = len.cast_unsigned();
+                                if cfg
+                                    .dirs
+                                    .iter()
+                                    .any(|d| file_path[..len].starts_with(d.as_bytes()))
+                                {
+                                    None
+                                } else {
+                                    Some(Response::FAN_ALLOW)
+                                }
+                            }
+                        }
                     };
-                    if len <= 0 {
-                        // ここのエラーハンドリングめんどい
-                        eprintln!(
-                            "Failed to get file path: {:?}",
-                            std::io::Error::last_os_error()
-                        );
-                        let _ = fanotify.get_ref().write_response(FanotifyResponse::new(
-                            event.fd().unwrap(),
-                            cfg.res_on_error,
-                        ));
-                        continue;
-                    }
-                    let len = len as usize;
-
-                    if cfg
-                        .dirs
-                        .iter()
-                        .any(|d| res[..len].starts_with(d.as_bytes()))
-                    {
+                    if let Some(res) = res {
+                        if let Err(e) = fanotify
+                            .get_ref()
+                            .write_response(FanotifyResponse::new(event.fd().unwrap(), res))
+                        {
+                            eprintln!("Failed to write response(early): {e}");
+                        }
+                    } else {
                         let cfg = cfg.clone();
                         let fanotify = fanotify.clone();
 
@@ -118,12 +123,6 @@ pub async fn event_loop(
                                 eprintln!("{e}");
                             }
                         });
-                    } else {
-                        // ここも
-                        let _ = fanotify.get_ref().write_response(FanotifyResponse::new(
-                            event.fd().unwrap(),
-                            Response::FAN_ALLOW,
-                        ));
                     }
                 }
                 guard.retain_ready();
