@@ -48,7 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Arc::new(config::Config {
         pids: cfg.pids,
-        dirs: cfg.directories.into_iter().map(std::convert::Into::into).collect(),
+        dirs: cfg
+            .directories
+            .into_iter()
+            .map(std::convert::Into::into)
+            .collect(),
         res_on_error: if cfg.deny_on_error {
             Response::FAN_DENY
         } else {
@@ -87,23 +91,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("Failed to initialize fanotify: {e}")
         }
     })?;
-    let mut added = HashSet::new();
+    let mut targets = HashSet::new();
     for dir in &cfg.dirs {
-        let mps = mountpoints
+        // dirより根に近い中で最もdirに近いもの
+        if let Some(best_mp) = mountpoints
             .iter()
-            .filter(|&mp| dir == mp || dir.starts_with(mp) || mp.starts_with(dir));
-        for mp in mps {
-            if added.insert(mp.clone()) {
-                println!("{}", mp.display());
-                fanotify.mark(
-                    MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_MOUNT,
-                    MaskFlags::FAN_OPEN_PERM,
-                    unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
-                    Some(mp),
-                )?;
-            }
+            .filter(|mp| dir.starts_with(mp))
+            .max_by_key(|mp| mp.components().count())
+        {
+            targets.insert(best_mp);
         }
+        // dirの子
+        mountpoints
+            .iter()
+            .filter(|mp| mp.starts_with(dir))
+            .for_each(|mp| {
+                targets.insert(mp);
+            });
     }
+    for mp in targets {
+        println!("{}", mp.display());
+        fanotify.mark(
+            MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_MOUNT,
+            MaskFlags::FAN_OPEN_PERM,
+            unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+            Some(mp),
+        )?;
+    }
+
     let fanotify = Arc::new(AsyncFd::new(fanotify)?);
 
     loop {
