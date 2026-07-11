@@ -18,6 +18,7 @@ use tokio::sync::Semaphore;
 
 mod config;
 mod job;
+mod scan;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
