@@ -2,12 +2,12 @@ use inotify::{EventMask, Inotify, StreamExt as _, WatchMask};
 use nix::{
     errno::Errno,
     libc,
-    sys::fanotify::{Fanotify, FanotifyResponse, Response},
+    sys::fanotify::{Fanotify, FanotifyResponse, MarkFlags, MaskFlags, Response},
 };
 use std::{
     fs,
     os::fd::{AsRawFd as _, BorrowedFd},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::io::unix::AsyncFd;
@@ -22,6 +22,7 @@ async fn job(fd: BorrowedFd<'_>, cfg: Arc<config::Config>) -> Response {
                     if resp.ends_with("OK") {
                         Response::FAN_ALLOW
                     } else if resp.ends_with("FOUND") {
+                        // パスが欲しい(LazyCell?)
                         println!("Threat detected: {resp}");
                         Response::FAN_DENY
                     } else {
@@ -68,7 +69,7 @@ pub async fn event_loop(
                             Some(Response::FAN_ALLOW)
                         } else {
                             let mut cursor = std::io::Cursor::new(&mut path[..]);
-                            // これはコケないのでunwrapして良い
+                            // pathのサイズと書き込まれる文字列のデータ長から、panicしなさそう
                             std::io::Write::write_fmt(
                                 &mut cursor,
                                 format_args!("/proc/self/fd/{}\0", event.fd().unwrap().as_raw_fd()),
@@ -116,6 +117,19 @@ pub async fn event_loop(
                         tokio::spawn(async move {
                             let fd = event.fd().unwrap();
                             let response = job(fd, cfg).await;
+
+                            // 次に書き込みがあるまでOPEN_PERMイベントを通知しない
+                            if response == Response::FAN_ALLOW
+                                && let Err(e) = fanotify.get_ref().mark(
+                                    MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_IGNORED_MASK,
+                                    MaskFlags::FAN_OPEN_PERM,
+                                    fd,
+                                    None::<&Path>,
+                                )
+                            {
+                                eprintln!("Failed to add ignore mark: {e}");
+                            }
+
                             if let Err(e) = fanotify
                                 .get_ref()
                                 .write_response(FanotifyResponse::new(fd, response))
