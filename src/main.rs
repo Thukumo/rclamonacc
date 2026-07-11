@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsFd;
 use std::{fs, os::fd::BorrowedFd, process, sync::Arc};
 
 use clap::Parser;
@@ -24,12 +24,25 @@ mod pool;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = config::Args::parse();
-    let mut cfg: config::Setting =
-        serde_json::from_reader(BufReader::new(File::open(args.config)?))?;
+    let config_file = File::open(&args.config).map_err(|e| {
+        format!(
+            "Failed to open config file '{}': {e}",
+            args.config.display(),
+        )
+    })?;
+    let mut cfg: config::Setting = serde_json::from_reader(BufReader::new(config_file))
+        .map_err(|e| format!("Failed to parse config file: {e}"))?;
+
+    let pid_content = fs::read_to_string(&cfg.pid_path)
+        .map_err(|e| format!("Failed to read clamd PID file '{}': {e}", cfg.pid_path))?;
+    let clamd_pid = pid_content
+        .trim_end()
+        .parse()
+        .map_err(|e| format!("Failed to parse PID from '{}': {e}", cfg.pid_path))?;
 
     cfg.pids.extend([
         // 自分とdaemonのPID
-        fs::read_to_string(cfg.pid_path)?.trim_end().parse()?,
+        clamd_pid,
         process::id(),
     ]);
 
@@ -48,8 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?,
     });
 
-    let mountpoints = Process::myself()?
-        .mountinfo()?
+    let mountpoints = Process::myself()
+        .map_err(|e| format!("Failed to get current process info: {e}"))?
+        .mountinfo()
+        .map_err(|e| format!("Failed to read mountinfo: {e}"))?
         .into_iter()
         .filter(|mp| {
             !matches!(
@@ -63,7 +78,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fanotify = Fanotify::init(
         InitFlags::FAN_CLASS_CONTENT | InitFlags::FAN_NONBLOCK,
         EventFFlags::O_RDONLY | EventFFlags::O_LARGEFILE,
-    )?;
+    )
+    .map_err(|e| {
+        if e == Errno::EPERM {
+            "Permission denied. This program must be run with root privileges (CAP_SYS_ADMIN)."
+                .to_string()
+        } else {
+            format!("Failed to initialize fanotify: {e}")
+        }
+    })?;
     let mut added = HashSet::new();
     for dir in &cfg.dirs {
         let mps = mountpoints
@@ -89,24 +112,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(events) => {
                 for event in events.into_iter().filter(|e| e.fd().is_some()) {
                     let cfg = cfg.clone();
-                    let raw_fd = event.fd().unwrap().as_raw_fd();
-                    let Ok(fd) = event.fd().unwrap().try_clone_to_owned() else {
-                        if let Err(e) = guard.get_inner().write_response(FanotifyResponse::new(
-                            event.fd().unwrap(),
-                            cfg.res_on_error,
-                        )) {
-                            eprintln!("{e}");
-                        }
-                        continue;
-                    };
                     let pid = event.pid().cast_unsigned();
                     let fanotify = fanotify.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = fanotify.get_ref().write_response(FanotifyResponse::new(
-                            unsafe { BorrowedFd::borrow_raw(raw_fd) },
-                            job::job(fd.as_fd(), pid, cfg).await,
-                        )) {
+                        let fd = event.fd().unwrap();
+                        let response = job::job(fd.as_fd(), pid, cfg).await;
+                        if let Err(e) = fanotify
+                            .get_ref()
+                            .write_response(FanotifyResponse::new(fd.as_fd(), response))
+                        {
                             eprintln!("{e}");
                         }
                     });

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use deadpool::managed;
-use tokio::{io::Interest, net::UnixStream};
+use tokio::net::UnixStream;
 
 pub struct StreamManager {
     path: PathBuf,
@@ -24,34 +24,20 @@ impl managed::Manager for StreamManager {
         obj: &mut Self::Type,
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<Self::Error> {
-        match obj.ready(Interest::READABLE | Interest::WRITABLE).await {
-            Ok(readiness) => {
-                if readiness.is_readable() {
-                    // 普通読めない
-                    return match obj.try_read(&mut [0; 1]) {
-                        Ok(0) => Err(managed::RecycleError::Backend(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionReset,
-                            "Connection closed",
-                        ))),
-                        Ok(_) => {
-                            // なんか残ってる
-                            Err(managed::RecycleError::Backend(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "",
-                            )))
-                        }
-                        Err(e) => Err(managed::RecycleError::Backend(e)),
-                    };
-                }
-                if readiness.is_writable() {
-                    Ok(())
-                } else {
-                    Err(managed::RecycleError::Backend(std::io::Error::new(
-                        std::io::ErrorKind::NotConnected,
-                        "Connection is not writable",
-                    )))
-                }
-            }
+        let mut buf = [0; 1];
+        match obj.try_read(&mut buf) {
+            Ok(0) => Err(managed::RecycleError::Backend(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "Connection closed",
+            ))),
+            Ok(_) => Err(managed::RecycleError::Backend(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Unexpected data in stream",
+            ))),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => match obj.take_error() {
+                Ok(None) => Ok(()),
+                Ok(Some(err)) | Err(err) => Err(managed::RecycleError::Backend(err)),
+            },
             Err(e) => Err(managed::RecycleError::Backend(e)),
         }
     }

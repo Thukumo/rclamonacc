@@ -26,10 +26,17 @@ pub async fn send_fildes(
     stream.write_all(b"zFILDES\0").await?;
     stream.flush().await?;
 
-    stream.try_io(tokio::io::Interest::WRITABLE, || {
-        sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-            .map_err(|e| io::Error::other(e.to_string()))
-    })?;
+    loop {
+        stream.writable().await?;
+        match stream.try_io(tokio::io::Interest::WRITABLE, || {
+            sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+                .map_err(|e| io::Error::other(e.to_string()))
+        }) {
+            Ok(_) => break,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     Ok(())
 }
