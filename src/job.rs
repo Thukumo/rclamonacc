@@ -14,32 +14,32 @@ use tokio::io::unix::AsyncFd;
 
 use crate::{config, scan};
 
-async fn job(fd: BorrowedFd<'_>, cfg: Arc<config::Config>) -> Response {
+async fn job(fd: BorrowedFd<'_>, cfg: Arc<config::Config>) -> Option<Response> {
     match tokio::time::timeout(std::time::Duration::from_secs(5), cfg.semaphore.acquire()).await {
         Ok(_) => {
             match scan::scan(cfg.clone(), fd).await {
                 Ok(resp) => {
                     if resp.ends_with("OK") {
-                        Response::FAN_ALLOW
+                        Some(Response::FAN_ALLOW)
                     } else if resp.ends_with("FOUND") {
                         // パスが欲しい(LazyCell?)
                         println!("Threat detected: {resp}");
-                        Response::FAN_DENY
+                        Some(Response::FAN_DENY)
                     } else {
                         // ERROR
                         eprintln!("Error Responce: {resp}");
-                        cfg.res_on_error
+                        None
                     }
                 }
                 Err(e) => {
                     eprintln!("Failed to scan: {e:?}");
-                    cfg.res_on_error
+                    None
                 }
             }
         }
         Err(e) => {
             eprintln!("Failed to acquire semaphore: {e:?}");
-            cfg.res_on_error
+            None
         }
     }
 }
@@ -61,12 +61,18 @@ pub async fn event_loop(
                     eprintln!("!! Queue overflowed !!");
                 }
                 for event in events.into_iter().filter(|e| e.fd().is_some()) {
+                    enum Status {
+                        Allowed,
+                        Ignored,
+                        Error,
+                        NeedScan,
+                    }
                     let res = {
                         let pid = event.pid().cast_unsigned();
                         if cfg.pids.contains(&pid)
                             || pid == cfg.clamd_pid.load(std::sync::atomic::Ordering::Acquire)
                         {
-                            Some(Response::FAN_ALLOW)
+                            Status::Allowed
                         } else {
                             let mut cursor = std::io::Cursor::new(&mut path[..]);
                             // pathのサイズと書き込まれる文字列のデータ長から、panicしなさそう
@@ -88,7 +94,7 @@ pub async fn event_loop(
                                     "Failed to get file path: {:?}",
                                     std::io::Error::last_os_error()
                                 );
-                                Some(cfg.res_on_error)
+                                Status::Error
                             } else {
                                 let len = len.cast_unsigned();
                                 if cfg
@@ -96,47 +102,62 @@ pub async fn event_loop(
                                     .iter()
                                     .any(|d| file_path[..len].starts_with(d.as_bytes()))
                                 {
-                                    None
+                                    Status::NeedScan
                                 } else {
-                                    Some(Response::FAN_ALLOW)
+                                    Status::Ignored
                                 }
                             }
                         }
                     };
-                    if let Some(res) = res {
-                        if let Err(e) = fanotify
-                            .get_ref()
-                            .write_response(FanotifyResponse::new(event.fd().unwrap(), res))
-                        {
-                            eprintln!("Failed to write response(early): {e}");
+                    match res {
+                        Status::Allowed => {
+                            if let Err(e) = fanotify.get_ref().write_response(
+                                FanotifyResponse::new(event.fd().unwrap(), Response::FAN_ALLOW),
+                            ) {
+                                eprintln!("Failed to write response(early): {e}");
+                            }
                         }
-                    } else {
-                        let cfg = cfg.clone();
-                        let fanotify = fanotify.clone();
-
-                        tokio::spawn(async move {
-                            let fd = event.fd().unwrap();
-                            let response = job(fd, cfg).await;
-
-                            // 次に書き込みがあるまでOPEN_PERMイベントを通知しない
-                            if response == Response::FAN_ALLOW
-                                && let Err(e) = fanotify.get_ref().mark(
-                                    MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_IGNORED_MASK,
-                                    MaskFlags::FAN_OPEN_PERM,
-                                    fd,
-                                    None::<&Path>,
-                                )
-                            {
-                                eprintln!("Failed to add ignore mark: {e}");
+                        Status::Error => {
+                            if let Err(e) = fanotify.get_ref().write_response(
+                                FanotifyResponse::new(event.fd().unwrap(), cfg.res_on_error),
+                            ) {
+                                eprintln!("Failed to write response(early): {e}");
                             }
-
-                            if let Err(e) = fanotify
-                                .get_ref()
-                                .write_response(FanotifyResponse::new(fd, response))
-                            {
-                                eprintln!("{e}");
+                        }
+                        Status::Ignored => {
+                            if let Err(e) = fanotify.get_ref().write_response(
+                                FanotifyResponse::new(event.fd().unwrap(), Response::FAN_ALLOW),
+                            ) {
+                                eprintln!("Failed to write response(early): {e}");
                             }
-                        });
+                        }
+                        Status::NeedScan => {
+                            let cfg = cfg.clone();
+                            let fanotify = fanotify.clone();
+
+                            tokio::spawn(async move {
+                                let fd = event.fd().unwrap();
+                                let response = job(fd, cfg.clone()).await;
+
+                                // 次に書き込みがあるまでOPEN_PERMイベントを通知しない
+                                if response == Some(Response::FAN_ALLOW)
+                                    && let Err(e) = fanotify.get_ref().mark(
+                                        MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_IGNORED_MASK,
+                                        MaskFlags::FAN_OPEN_PERM,
+                                        fd,
+                                        None::<&Path>,
+                                    )
+                                {
+                                    eprintln!("Failed to add ignore mark: {e}");
+                                }
+
+                                if let Err(e) = fanotify.get_ref().write_response(
+                                    FanotifyResponse::new(fd, response.unwrap_or(cfg.res_on_error)),
+                                ) {
+                                    eprintln!("{e}");
+                                }
+                            });
+                        }
                     }
                 }
                 guard.retain_ready();
