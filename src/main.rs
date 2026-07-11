@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Arc::new(config::Config {
         pids: cfg.pids,
-        dirs: cfg.dirs.into_iter().map(std::convert::Into::into).collect(),
+        dirs: cfg.directories.into_iter().map(std::convert::Into::into).collect(),
         res_on_error: if cfg.deny_on_error {
             Response::FAN_DENY
         } else {

@@ -14,7 +14,7 @@ pub struct Setting {
     pub pid_path: String,
     #[serde(default = "max_connection")]
     pub max_connection: usize,
-    pub dirs: Vec<String>,
+    pub directories: Vec<String>,
     #[serde(default)]
     pub deny_on_error: bool,
     #[serde(default)]
