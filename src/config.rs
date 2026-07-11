@@ -39,7 +39,7 @@ pub struct Args {
 pub struct Config {
     pub pids: Vec<u32>,
     pub clamd_pid: AtomicU32,
-    pub dirs: Vec<PathBuf>,
+    pub dirs: Vec<String>,
     pub res_on_error: Response,
     pub semaphore: Semaphore,
     pub socket_path: PathBuf,

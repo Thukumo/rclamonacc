@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 use std::{fs, os::fd::BorrowedFd, process, sync::Arc};
 
@@ -29,10 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.config.display(),
         )
     })?;
-    let mut cfg: config::Setting = serde_json::from_reader(BufReader::new(config_file))
+    let mut setting: config::Setting = serde_json::from_reader(BufReader::new(config_file))
         .map_err(|e| format!("Failed to parse config file: {e}"))?;
 
-    let pid_path = PathBuf::from(cfg.pid_path);
+    let pid_path = PathBuf::from(setting.pid_path);
     let pid_content = fs::read_to_string(&pid_path).map_err(|e| {
         format!(
             "Failed to read clamd PID file '{}': {e}",
@@ -46,27 +46,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to parse PID from '{}': {e}", pid_path.display()))?,
     );
 
-    cfg.pids.extend([
+    setting.pids.extend([
         // 自分のPID
         process::id(),
     ]);
 
-    let cfg = Arc::new(config::Config {
-        pids: cfg.pids,
+    let cfg = config::Config {
+        pids: setting.pids,
         clamd_pid,
-        dirs: cfg
+        dirs: setting
             .directories
             .into_iter()
-            .map(std::convert::Into::into)
+            .map(|mut s| {
+                if !s.ends_with('/') {
+                    s += "/";
+                }
+                s
+            })
             .collect(),
-        res_on_error: if cfg.deny_on_error {
+        res_on_error: if setting.deny_on_error {
             Response::FAN_DENY
         } else {
             Response::FAN_ALLOW
         },
-        semaphore: Semaphore::new(cfg.max_connection),
-        socket_path: cfg.socket_path.into(),
-    });
+        semaphore: Semaphore::new(setting.max_connection),
+        socket_path: setting.socket_path.into(),
+    };
 
     let mountpoints = Process::myself()
         .map_err(|e| format!("Failed to get current process info: {e}"))?
@@ -95,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
     let mut targets = HashSet::new();
-    for dir in &cfg.dirs {
+    for dir in cfg.dirs.iter().map(Path::new) {
         // dirより根に近い中で最もdirに近いもの
         if let Some(best_mp) = mountpoints
             .iter()
@@ -112,6 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 targets.insert(mp);
             });
     }
+    let cfg = Arc::new(cfg);
+
     for mp in targets {
         println!("{}", mp.display());
         fanotify.mark(
