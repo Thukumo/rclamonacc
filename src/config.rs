@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::atomic::AtomicU32};
 
 use deadpool::managed::Pool;
 use nix::sys::fanotify::Response;
@@ -40,6 +40,7 @@ pub struct Args {
 
 pub struct Config {
     pub pids: Vec<u32>,
+    pub clamd_pid: AtomicU32,
     pub dirs: Vec<PathBuf>,
     pub res_on_error: Response,
     pub pool: Pool<pool::StreamManager>,

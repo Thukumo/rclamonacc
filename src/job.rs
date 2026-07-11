@@ -1,23 +1,27 @@
-use nix::sys::{
-    fanotify::Response,
-    socket::{ControlMessage, MsgFlags, sendmsg},
+use deadpool::managed::{self, Object};
+use inotify::{EventMask, Inotify, StreamExt as _, WatchMask};
+use nix::{
+    errno::Errno,
+    sys::{
+        fanotify::{Fanotify, FanotifyResponse, Response},
+        socket::{ControlMessage, MsgFlags, sendmsg},
+    },
 };
 use std::{
+    fs,
     io::{self, IoSlice},
-    os::fd::{AsRawFd as _, BorrowedFd},
+    os::fd::{AsFd as _, AsRawFd as _, BorrowedFd},
+    path::PathBuf,
     sync::Arc,
 };
-use tokio::{
-    fs,
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
-};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, unix::AsyncFd};
 
-use crate::{config, job};
+use crate::{config, job, pool::StreamManager};
 
-pub async fn send_fildes(
+async fn send_fildes(
     stream: &mut tokio::net::UnixStream,
     fd_to_scan: std::os::fd::BorrowedFd<'_>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let iov = [IoSlice::new(&[0u8; 1])];
     let fd = [fd_to_scan.as_raw_fd()];
     let cmsg = [ControlMessage::ScmRights(&fd)];
@@ -30,7 +34,7 @@ pub async fn send_fildes(
         stream.writable().await?;
         match stream.try_io(tokio::io::Interest::WRITABLE, || {
             sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-                .map_err(|e| io::Error::other(e.to_string()))
+                .map_err(std::convert::Into::into)
         }) {
             Ok(_) => break,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -41,7 +45,7 @@ pub async fn send_fildes(
     Ok(())
 }
 
-pub async fn read_response(
+async fn read_response(
     stream: &mut tokio::net::UnixStream,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut buf = Vec::new();
@@ -57,37 +61,97 @@ pub async fn read_response(
     Ok(s.trim_end_matches('\0').to_string())
 }
 
-pub async fn job(fd: BorrowedFd<'_>, pid: u32, cfg: Arc<config::Config>) -> Response {
-    if cfg.pids.contains(&pid) {
+async fn scan(
+    conn: Object<StreamManager>,
+    fd: BorrowedFd<'_>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    struct ScanConnection(Option<Object<StreamManager>>);
+
+    impl ScanConnection {
+        fn new(conn: Object<StreamManager>) -> Self {
+            Self(Some(conn))
+        }
+
+        fn recycle(mut self) {
+            let _ = self.0.take();
+        }
+    }
+
+    impl std::ops::Deref for ScanConnection {
+        type Target = Object<StreamManager>;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+    impl std::ops::DerefMut for ScanConnection {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.0.as_mut().unwrap()
+        }
+    }
+    impl Drop for ScanConnection {
+        fn drop(&mut self) {
+            if let Some(conn) = self.0.take() {
+                let _ = Object::take(conn);
+            }
+        }
+    }
+
+    let mut conn = ScanConnection::new(conn);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        job::send_fildes(&mut conn, fd),
+    )
+    .await
+    .map_err(|e| format!("Send timeout: {e:?}"))
+    .and_then(|inner| inner.map_err(|e| format!("Send Error: {e:?}")))
+    .map_err(Box::<dyn std::error::Error>::from)?;
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        job::read_response(&mut conn),
+    )
+    .await
+    .map_err(|e| format!("Read timeout: {e:?}"))
+    .and_then(|inner| inner.map_err(|e| format!("Read Error: {e:?}")))
+    .map_err(Box::<dyn std::error::Error>::from)?;
+
+    conn.recycle();
+
+    Ok(resp)
+}
+
+async fn job(fd: BorrowedFd<'_>, pid: u32, cfg: Arc<config::Config>) -> Response {
+    if cfg.pids.contains(&pid) || pid == cfg.clamd_pid.load(std::sync::atomic::Ordering::Acquire) {
         Response::FAN_ALLOW
-    } else if let Ok(file_path) = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).await {
-        println!("{}", file_path.display());
+    } else if let Ok(file_path) = fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
         if cfg.dirs.iter().any(|dir| file_path.starts_with(dir)) {
-            if let Ok(mut conn) = cfg.pool.get().await {
-                if let Err(err) = job::send_fildes(&mut conn, fd).await {
-                    eprintln!("Failed to send fd: {err:?}");
-                    cfg.res_on_error
-                } else {
-                    match job::read_response(&mut conn).await {
+            match cfg
+                .pool
+                .timeout_get(&managed::Timeouts::wait_millis(5000))
+                .await
+            {
+                Ok(conn) => {
+                    match scan(conn, fd).await {
                         Ok(resp) => {
-                            println!("Scan result for {}: {resp}", file_path.display());
                             if resp.ends_with("OK") {
                                 Response::FAN_ALLOW
                             } else if resp.ends_with("FOUND") {
+                                println!("Threat detected: {resp}");
                                 Response::FAN_DENY
                             } else {
                                 // ERROR
+                                eprintln!("Error: {resp}");
                                 cfg.res_on_error
                             }
                         }
-                        Err(err) => {
-                            eprintln!("Failed to read response: {err:?}");
+                        Err(e) => {
+                            eprintln!("Failed to read response: {e:?}");
                             cfg.res_on_error
                         }
                     }
                 }
-            } else {
-                cfg.res_on_error
+                Err(_) => cfg.res_on_error,
             }
         } else {
             Response::FAN_ALLOW
@@ -95,4 +159,82 @@ pub async fn job(fd: BorrowedFd<'_>, pid: u32, cfg: Arc<config::Config>) -> Resp
     } else {
         cfg.res_on_error
     }
+}
+
+pub async fn event_loop(
+    fanotify: Fanotify,
+    cfg: Arc<config::Config>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fanotify = Arc::new(AsyncFd::new(fanotify)?);
+
+    loop {
+        let mut guard = fanotify.readable().await?;
+        match guard.get_inner().read_events() {
+            Ok(events) => {
+                if events.iter().any(|e| e.fd().is_none()) {
+                    eprintln!("!! Queue overflowed !!");
+                }
+                for event in events.into_iter().filter(|e| e.fd().is_some()) {
+                    let cfg = cfg.clone();
+                    let pid = event.pid().cast_unsigned();
+                    let fanotify = fanotify.clone();
+
+                    tokio::spawn(async move {
+                        let fd = event.fd().unwrap();
+                        let response = job::job(fd.as_fd(), pid, cfg).await;
+                        if let Err(e) = fanotify
+                            .get_ref()
+                            .write_response(FanotifyResponse::new(fd.as_fd(), response))
+                        {
+                            eprintln!("{e}");
+                        }
+                    });
+                }
+                guard.retain_ready();
+            }
+            Err(e) if e == Errno::EWOULDBLOCK => {
+                guard.clear_ready();
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+pub async fn watch_pid_file(
+    path: PathBuf,
+    cfg: Arc<config::Config>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("Failed to get parent directory of {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("Failed to get filename of {}", path.display()))?;
+
+    let inotify = Inotify::init().map_err(|e| format!("Failed to init inotify: {e}"))?;
+    inotify
+        .watches()
+        .add(dir, WatchMask::CLOSE_WRITE | WatchMask::CREATE)
+        .map_err(|e| format!("Failed to add inotify watch: {e}"))?;
+    let mut buf = [0u8; 4096];
+    let mut stream = inotify
+        .into_event_stream(&mut buf)
+        .map_err(|e| format!("Failed to convert inotify into stream: {e}"))?;
+
+    while let Some(ev) = stream.next().await {
+        if let Ok(ev) = ev
+            && let Some(name) = ev.name
+            && name == file_name
+            && (ev.mask.contains(EventMask::CLOSE_WRITE) || ev.mask.contains(EventMask::CREATE))
+            && let Ok(s) = fs::read_to_string(&path)
+            && let Ok(pid) = s.trim_end().parse::<u32>()
+        {
+            cfg.clamd_pid
+                .store(pid, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    Ok(())
 }

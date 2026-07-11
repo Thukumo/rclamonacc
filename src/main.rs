@@ -1,21 +1,20 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
-use std::os::fd::AsFd;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
 use std::{fs, os::fd::BorrowedFd, process, sync::Arc};
 
 use clap::Parser;
 use deadpool::managed;
 use nix::errno::Errno;
-use nix::sys::fanotify::{FanotifyResponse, Response};
+use nix::sys::fanotify::Response;
 
 use nix::{
     libc,
     sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags},
 };
 use procfs::process::Process;
-
-use tokio::io::unix::AsyncFd;
 
 mod config;
 mod job;
@@ -33,21 +32,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cfg: config::Setting = serde_json::from_reader(BufReader::new(config_file))
         .map_err(|e| format!("Failed to parse config file: {e}"))?;
 
-    let pid_content = fs::read_to_string(&cfg.pid_path)
-        .map_err(|e| format!("Failed to read clamd PID file '{}': {e}", cfg.pid_path))?;
-    let clamd_pid = pid_content
-        .trim_end()
-        .parse()
-        .map_err(|e| format!("Failed to parse PID from '{}': {e}", cfg.pid_path))?;
+    let pid_path = PathBuf::from(cfg.pid_path);
+    let pid_content = fs::read_to_string(&pid_path).map_err(|e| {
+        format!(
+            "Failed to read clamd PID file '{}': {e}",
+            pid_path.display()
+        )
+    })?;
+    let clamd_pid = AtomicU32::new(
+        pid_content
+            .trim_end()
+            .parse::<u32>()
+            .map_err(|e| format!("Failed to parse PID from '{}': {e}", pid_path.display()))?,
+    );
 
     cfg.pids.extend([
-        // 自分とdaemonのPID
-        clamd_pid,
+        // 自分のPID
         process::id(),
     ]);
 
     let cfg = Arc::new(config::Config {
         pids: cfg.pids,
+        clamd_pid,
         dirs: cfg
             .directories
             .into_iter()
@@ -118,37 +124,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(mp),
         )?;
     }
-
-    let fanotify = Arc::new(AsyncFd::new(fanotify)?);
-
-    loop {
-        let mut guard = fanotify.readable().await?;
-        match guard.get_inner().read_events() {
-            Ok(events) => {
-                for event in events.into_iter().filter(|e| e.fd().is_some()) {
-                    let cfg = cfg.clone();
-                    let pid = event.pid().cast_unsigned();
-                    let fanotify = fanotify.clone();
-
-                    tokio::spawn(async move {
-                        let fd = event.fd().unwrap();
-                        let response = job::job(fd.as_fd(), pid, cfg).await;
-                        if let Err(e) = fanotify
-                            .get_ref()
-                            .write_response(FanotifyResponse::new(fd.as_fd(), response))
-                        {
-                            eprintln!("{e}");
-                        }
-                    });
-                }
-                guard.retain_ready();
-            }
-            Err(e) if e == Errno::EWOULDBLOCK => {
-                guard.clear_ready();
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
+    tokio::select! {
+        res = job::event_loop(fanotify, cfg.clone()) => {
+            res?;
+        },
+        res = job::watch_pid_file(pid_path, cfg.clone()) => {
+            res?;
         }
     }
+    Ok(())
 }
