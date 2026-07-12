@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
+derive_more = { version = "2.1.1", features = ["deref", "as_ref"] }
 inotify = "0.11.4"
 nix = { version = "0.31.3", features = ["fanotify", "socket", "uio"] }
 procfs = "0.18.0"

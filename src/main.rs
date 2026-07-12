@@ -54,16 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::Config {
         pids: setting.pids,
         clamd_pid,
-        dirs: setting
-            .directories
-            .into_iter()
-            .map(|mut s| {
-                if !s.ends_with('/') {
-                    s += "/";
-                }
-                s
-            })
-            .collect(),
+        dirs: setting.directories,
+        ex_dirs: setting.exclude_directories,
         res_on_error: if setting.deny_on_error {
             Response::FAN_DENY
         } else {
@@ -112,7 +104,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // dirの子
         mountpoints
             .iter()
+            // dirの子である
             .filter(|mp| mp.starts_with(dir))
+            // 除外ディレクトリ, またはその子でない
+            .filter(|mp| !cfg.ex_dirs.iter().any(|d| mp.starts_with(d)))
             .for_each(|mp| {
                 targets.insert(mp);
             });

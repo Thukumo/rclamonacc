@@ -6,7 +6,10 @@ use nix::{
 };
 use std::{
     fs,
-    os::fd::{AsRawFd as _, BorrowedFd},
+    os::{
+        fd::{AsRawFd as _, BorrowedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -105,6 +108,10 @@ pub async fn event_loop(
                                     .dirs
                                     .iter()
                                     .any(|d| file_path[..len].starts_with(d.as_bytes()))
+                                    && !cfg
+                                        .ex_dirs
+                                        .iter()
+                                        .any(|d| file_path[..len].starts_with(d.as_bytes()))
                                 {
                                     Status::NeedScan
                                 } else {
