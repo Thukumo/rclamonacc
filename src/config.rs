@@ -26,7 +26,8 @@ impl<'de> Deserialize<'de> for AbsoluteDirPath {
         let path = Path::new(&s);
         if !path.is_absolute() {
             return Err(serde::de::Error::custom(format!(
-                "Path must be absolute: {}", s.display()
+                "Path must be absolute: {}",
+                s.display()
             )));
         }
         Ok(Self(if s.as_bytes().ends_with(b"/") {
@@ -40,6 +41,7 @@ impl<'de> Deserialize<'de> for AbsoluteDirPath {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Setting {
     #[serde(default = "socket_path")]
     pub socket_path: OsString,
@@ -53,7 +55,7 @@ pub struct Setting {
     #[serde(default)]
     pub deny_on_error: bool,
     #[serde(default)]
-    pub pids: Vec<u32>,
+    pub exclude_uids: Vec<u32>,
 }
 
 // RH系だと違ったりするらしい
@@ -74,7 +76,8 @@ pub struct Args {
 }
 
 pub struct Config {
-    pub pids: Vec<u32>,
+    pub uids: Vec<u32>,
+    pub my_pid: u32,
     pub clamd_pid: AtomicU32,
     pub dirs: Vec<AbsoluteDirPath>,
     pub ex_dirs: Vec<AbsoluteDirPath>,

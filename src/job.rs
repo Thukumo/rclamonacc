@@ -6,6 +6,8 @@ use nix::{
 };
 use std::{
     fs,
+    io::Write as _,
+    mem::MaybeUninit,
     os::{
         fd::{AsRawFd as _, BorrowedFd},
         unix::ffi::OsStrExt,
@@ -51,14 +53,81 @@ async fn job(fd: BorrowedFd<'_>, cfg: Arc<config::Config>) -> Option<Response> {
     }
 }
 
+enum Status {
+    Allowed,
+    Ignored,
+    Error,
+    NeedScan,
+}
+
+fn determine_status(cfg: &Arc<config::Config>, fd: BorrowedFd<'_>, pid: u32) -> Status {
+    if pid == cfg.clamd_pid.load(std::sync::atomic::Ordering::Relaxed) || pid == cfg.my_pid {
+        Status::Allowed
+    } else {
+        let mut file_path = [MaybeUninit::<u8>::uninit(); 4096];
+        let len = unsafe {
+            let mut path = [0u8; 32];
+            let len = path.len();
+            write!(&mut path[..len - 1], "/proc/self/fd/{}", fd.as_raw_fd()).unwrap_unchecked();
+
+            libc::readlink(
+                path.as_ptr().cast::<libc::c_char>(),
+                file_path.as_mut_ptr().cast::<libc::c_char>(),
+                file_path.len(),
+            )
+        };
+        if len <= 0 {
+            eprintln!(
+                "Failed to get file path: {:?}",
+                std::io::Error::last_os_error()
+            );
+            Status::Error
+        } else {
+            let file_path = unsafe {
+                std::slice::from_raw_parts(file_path.as_ptr().cast::<u8>(), len.unsigned_abs())
+            };
+            if cfg.dirs.iter().any(|d| file_path.starts_with(d.as_bytes()))
+                && !cfg
+                    .ex_dirs
+                    .iter()
+                    .any(|d| file_path.starts_with(d.as_bytes()))
+            {
+                // 重めなので可能なら飛ばす
+                if cfg.uids.is_empty() {
+                    Status::NeedScan
+                } else {
+                    unsafe {
+                        let mut stat = MaybeUninit::uninit();
+                        let mut path = [0u8; 32];
+                        let len = path.len();
+                        write!(&mut path[..len - 1], "/proc/{pid}").unwrap_unchecked();
+                        let res =
+                            libc::lstat(path.as_ptr().cast::<libc::c_char>(), stat.as_mut_ptr());
+
+                        if res == 0 {
+                            if cfg.uids.contains(&stat.assume_init().st_uid) {
+                                Status::Ignored
+                            } else {
+                                Status::NeedScan
+                            }
+                        } else {
+                            eprintln!("lstat failed: {res}");
+                            Status::Error
+                        }
+                    }
+                }
+            } else {
+                Status::Ignored
+            }
+        }
+    }
+}
+
 pub async fn event_loop(
     fanotify: Fanotify,
     cfg: Arc<config::Config>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fanotify = Arc::new(AsyncFd::new(fanotify)?);
-
-    let mut path = [0u8; 32];
-    let mut file_path = [0u8; 4096];
 
     loop {
         let mut guard = fanotify.readable().await?;
@@ -68,77 +137,24 @@ pub async fn event_loop(
                     eprintln!("!! Queue overflowed !!");
                 }
                 for event in events.into_iter().filter(|e| e.fd().is_some()) {
-                    enum Status {
-                        Allowed,
-                        Ignored,
-                        Error,
-                        NeedScan,
-                    }
-                    let res = {
-                        let pid = event.pid().cast_unsigned();
-                        if cfg.pids.contains(&pid)
-                            || pid == cfg.clamd_pid.load(std::sync::atomic::Ordering::Acquire)
-                        {
-                            Status::Allowed
-                        } else {
-                            let mut cursor = std::io::Cursor::new(&mut path[..]);
-                            // pathのサイズと書き込まれる文字列のデータ長から、panicしなさそう
-                            std::io::Write::write_fmt(
-                                &mut cursor,
-                                format_args!("/proc/self/fd/{}\0", event.fd().unwrap().as_raw_fd()),
-                            )
-                            .unwrap();
+                    let fd = event.fd().unwrap();
 
-                            let len = unsafe {
-                                libc::readlink(
-                                    path.as_ptr().cast::<libc::c_char>(),
-                                    file_path.as_mut_ptr().cast::<libc::c_char>(),
-                                    file_path.len(),
-                                )
-                            };
-                            if len <= 0 {
-                                eprintln!(
-                                    "Failed to get file path: {:?}",
-                                    std::io::Error::last_os_error()
-                                );
-                                Status::Error
-                            } else {
-                                let len = len.cast_unsigned();
-                                if cfg
-                                    .dirs
-                                    .iter()
-                                    .any(|d| file_path[..len].starts_with(d.as_bytes()))
-                                    && !cfg
-                                        .ex_dirs
-                                        .iter()
-                                        .any(|d| file_path[..len].starts_with(d.as_bytes()))
-                                {
-                                    Status::NeedScan
-                                } else {
-                                    Status::Ignored
-                                }
-                            }
-                        }
-                    };
-                    match res {
-                        Status::Allowed => {
-                            if let Err(e) = fanotify.get_ref().write_response(
-                                FanotifyResponse::new(event.fd().unwrap(), Response::FAN_ALLOW),
-                            ) {
+                    match determine_status(&cfg, fd, event.pid().cast_unsigned()) {
+                        // IgnoredもIgnoreのしたさがある
+                        // Ignoredな場所にあったファイルが監視対象の場所に移動された場合困りそうなので放置している
+                        Status::Allowed | Status::Ignored => {
+                            if let Err(e) = fanotify
+                                .get_ref()
+                                .write_response(FanotifyResponse::new(fd, Response::FAN_ALLOW))
+                            {
                                 eprintln!("Failed to write response(early): {e}");
                             }
                         }
                         Status::Error => {
-                            if let Err(e) = fanotify.get_ref().write_response(
-                                FanotifyResponse::new(event.fd().unwrap(), cfg.res_on_error),
-                            ) {
-                                eprintln!("Failed to write response(early): {e}");
-                            }
-                        }
-                        Status::Ignored => {
-                            if let Err(e) = fanotify.get_ref().write_response(
-                                FanotifyResponse::new(event.fd().unwrap(), Response::FAN_ALLOW),
-                            ) {
+                            if let Err(e) = fanotify
+                                .get_ref()
+                                .write_response(FanotifyResponse::new(fd, cfg.res_on_error))
+                            {
                                 eprintln!("Failed to write response(early): {e}");
                             }
                         }
@@ -233,7 +249,7 @@ pub async fn watch_pid_file(
             && let Ok(pid) = s.trim_end().parse::<u32>()
         {
             cfg.clamd_pid
-                .store(pid, std::sync::atomic::Ordering::Release);
+                .store(pid, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
     net::UnixStream,
 };
 
@@ -42,16 +42,11 @@ async fn read_response(
     stream: &mut tokio::net::UnixStream,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut buf = Vec::new();
-    let mut temp = [0u8; 128];
-    while buf.last() != Some(&0) {
-        let n = stream.read(&mut temp).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&temp[..n]);
+    BufReader::new(stream).read_until(b'\0', &mut buf).await?;
+    if buf.last() == Some(&0) {
+        buf.pop();
     }
-    let s = String::from_utf8_lossy(&buf);
-    Ok(s.trim_end_matches('\0').to_string())
+    Ok(String::from_utf8(buf)?)
 }
 
 pub async fn scan(

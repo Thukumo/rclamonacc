@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.config.display(),
         )
     })?;
-    let mut setting: config::Setting = serde_json::from_reader(BufReader::new(config_file))
+    let setting: config::Setting = serde_json::from_reader(BufReader::new(config_file))
         .map_err(|e| format!("Failed to parse config file: {e}"))?;
 
     let pid_path = PathBuf::from(setting.pid_path);
@@ -46,13 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Failed to parse PID from '{}': {e}", pid_path.display()))?,
     );
 
-    setting.pids.extend([
-        // 自分のPID
-        process::id(),
-    ]);
-
     let cfg = config::Config {
-        pids: setting.pids,
+        uids: setting.exclude_uids,
+        my_pid: process::id(),
         clamd_pid,
         dirs: setting.directories,
         ex_dirs: setting.exclude_directories,
