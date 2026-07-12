@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
     os::unix::ffi::{OsStrExt, OsStringExt},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::atomic::AtomicU32,
 };
 
@@ -22,14 +22,14 @@ impl<'de> Deserialize<'de> for AbsoluteDirPath {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = OsString::deserialize(deserializer)?;
-        let path = Path::new(&s);
+        let path = PathBuf::deserialize(deserializer)?;
         if !path.is_absolute() {
             return Err(serde::de::Error::custom(format!(
                 "Path must be absolute: {}",
-                s.display()
+                path.display()
             )));
         }
+        let s = path.into_os_string();
         Ok(Self(if s.as_bytes().ends_with(b"/") {
             s
         } else {
@@ -44,9 +44,9 @@ impl<'de> Deserialize<'de> for AbsoluteDirPath {
 #[serde(rename_all = "camelCase")]
 pub struct Setting {
     #[serde(default = "socket_path")]
-    pub socket_path: OsString,
+    pub socket_path: PathBuf,
     #[serde(default = "pid_path")]
-    pub pid_path: OsString,
+    pub pid_path: PathBuf,
     #[serde(default = "max_connection")]
     pub max_connection: usize,
     pub directories: Vec<AbsoluteDirPath>,
@@ -59,10 +59,10 @@ pub struct Setting {
 }
 
 // RH系だと違ったりするらしい
-fn socket_path() -> OsString {
+fn socket_path() -> PathBuf {
     "/run/clamav/clamd.ctl".into()
 }
-fn pid_path() -> OsString {
+fn pid_path() -> PathBuf {
     "/run/clamav/clamd.pid".into()
 }
 

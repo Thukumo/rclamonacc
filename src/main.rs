@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::AtomicU32;
 use std::{fs, os::fd::BorrowedFd, process, sync::Arc};
 
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let setting: config::Setting = serde_json::from_reader(BufReader::new(config_file))
         .map_err(|e| format!("Failed to parse config file: {e}"))?;
 
-    let pid_path = PathBuf::from(setting.pid_path);
+    let pid_path = setting.pid_path;
     let pid_content = fs::read_to_string(&pid_path).map_err(|e| {
         format!(
             "Failed to read clamd PID file '{}': {e}",
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Response::FAN_ALLOW
         },
         semaphore: Semaphore::new(setting.max_connection),
-        socket_path: setting.socket_path.into(),
+        socket_path: setting.socket_path,
     };
 
     let mountpoints = Process::myself()
