@@ -16,13 +16,13 @@ use crate::{config, scan};
 
 async fn job(fd: BorrowedFd<'_>, cfg: Arc<config::Config>) -> Option<Response> {
     match tokio::time::timeout(std::time::Duration::from_secs(5), cfg.semaphore.acquire()).await {
-        Ok(_) => {
+        Ok(Ok(_permit)) => {
             match scan::scan(cfg.clone(), fd).await {
                 Ok(resp) => {
                     if resp.ends_with("OK") {
                         Some(Response::FAN_ALLOW)
                     } else if resp.ends_with("FOUND") {
-                        // パスが欲しい(LazyCell?)
+                        // パス出したいかもな
                         println!("Threat detected: {resp}");
                         Some(Response::FAN_DENY)
                     } else {
@@ -37,8 +37,12 @@ async fn job(fd: BorrowedFd<'_>, cfg: Arc<config::Config>) -> Option<Response> {
                 }
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Failed to acquire semaphore: {e:?}");
+            None
+        }
+        Err(e) => {
+            eprintln!("Semaphore timeout: {e:?}");
             None
         }
     }
