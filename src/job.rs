@@ -140,14 +140,28 @@ pub async fn event_loop(
                                 let response = job(fd, cfg.clone()).await;
 
                                 // 次に書き込みがあるまでOPEN_PERMイベントを通知しない
-                                if response == Some(Response::FAN_ALLOW)
-                                    && let Err(e) = fanotify.get_ref().mark(
-                                        MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_IGNORED_MASK,
-                                        MaskFlags::FAN_OPEN_PERM,
-                                        fd,
-                                        None::<&Path>,
-                                    )
-                                {
+                                let res = if response == Some(Response::FAN_ALLOW) {
+                                    fanotify
+                                        .get_ref()
+                                        .mark(
+                                            MarkFlags::FAN_MARK_ADD
+                                                | MarkFlags::FAN_MARK_IGNORED_MASK,
+                                            MaskFlags::FAN_OPEN_PERM,
+                                            fd,
+                                            None::<&Path>,
+                                        )
+                                        .err()
+                                } else {
+                                    None
+                                };
+
+                                if let Err(e) = fanotify.get_ref().write_response(
+                                    FanotifyResponse::new(fd, response.unwrap_or(cfg.res_on_error)),
+                                ) {
+                                    eprintln!("{e}");
+                                }
+
+                                if let Some(e) = res {
                                     if e == Errno::ENOSPC {
                                         // IGNOREのしすぎ
                                         if let Err(e) = fanotify.get_ref().mark(
@@ -159,14 +173,8 @@ pub async fn event_loop(
                                             eprintln!("Failed to flush mark: {e}");
                                         }
                                     } else {
-                                        eprintln!("Failed to add ignore mark: {e}");
+                                        eprintln!("Falied to add ignored mask: {e}");
                                     }
-                                }
-
-                                if let Err(e) = fanotify.get_ref().write_response(
-                                    FanotifyResponse::new(fd, response.unwrap_or(cfg.res_on_error)),
-                                ) {
-                                    eprintln!("{e}");
                                 }
                             });
                         }
