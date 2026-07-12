@@ -148,7 +148,19 @@ pub async fn event_loop(
                                         None::<&Path>,
                                     )
                                 {
-                                    eprintln!("Failed to add ignore mark: {e}");
+                                    if e == Errno::ENOSPC {
+                                        // IGNOREのしすぎ
+                                        if let Err(e) = fanotify.get_ref().mark(
+                                            MarkFlags::FAN_MARK_FLUSH,
+                                            MaskFlags::empty(),
+                                            unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
+                                            None::<&Path>,
+                                        ) {
+                                            eprintln!("Failed to flush mark: {e}");
+                                        }
+                                    } else {
+                                        eprintln!("Failed to add ignore mark: {e}");
+                                    }
                                 }
 
                                 if let Err(e) = fanotify.get_ref().write_response(
